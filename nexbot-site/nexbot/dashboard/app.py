@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..core.config import BOT_NAME, VERSION, get_settings
 from ..core.migrations import run_migrations
+from . import diagnostics
 from .routes import api, pages
 from .web import BASE_DIR, templates
 
@@ -25,10 +26,20 @@ CSP = ("default-src 'self'; img-src 'self' https://cdn.discordapp.com https: dat
 def create_app() -> FastAPI:
     state = {"migrated": False}
 
-    def ensure_db() -> None:
+    def ensure_db() -> list[str]:
+        """Prépare la base. Ne lève jamais d'exception : renvoie la liste des problèmes à afficher."""
+        problems = diagnostics.config_problems()
+        if problems:
+            return problems
         if not state["migrated"]:
-            run_migrations()  # idempotent : sûr à chaque démarrage à froid (Vercel)
-            state["migrated"] = True
+            try:
+                run_migrations()  # idempotent : sûr à chaque démarrage à froid (Vercel)
+                state["migrated"] = True
+            except Exception as exc:
+                log.exception("Connexion à la base de données impossible")
+                return ["Connexion à la base de données impossible. Vérifiez DATABASE_URL "
+                        "(adresse Neon complète, copiée sans espace). Détail : " + diagnostics.describe_db_error(exc)]
+        return []
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -37,13 +48,18 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title=f"{BOT_NAME} Dashboard", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
-    app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+    app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static"), check_dir=False), name="static")
     app.include_router(pages.router)
     app.include_router(api.router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        ensure_db()  # certains hébergeurs serverless n'envoient pas l'événement lifespan
+        # certains hébergeurs serverless n'envoient pas l'événement lifespan
+        problems = [] if request.url.path.startswith("/static/") else ensure_db()
+        if problems:
+            if request.url.path.startswith("/api/"):
+                return JSONResponse({"message": problems[0], "errors": []}, status_code=503)
+            return HTMLResponse(diagnostics.render_page(problems), status_code=503)
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", CSP)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -92,3 +108,4 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
